@@ -1,0 +1,2683 @@
+/*
+ * Smart Office - STM32F103C6T6
+ * Entry RFID only, 15 events, optional Wi-Fi.
+ *
+ * LCD/I2C revision:
+ * - Wait for STOP and bus idle after transfers.
+ * - Do not reset the shared bus merely because a device NACKs.
+ * - Bounded bus recovery and STM32F1 filter-unlock sequence.
+ * - Restart LCD initialization after bus recovery.
+ *
+ * Keep existing Cube HAL, startup and interrupt files.
+ * USART1 and DMA1 Channel 5 IRQs are disabled; RX uses circular DMA.
+ * EXTI15_10_IRQHandler calls HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_10).
+ * SysTick_Handler calls HAL_IncTick().
+ *
+ * Build with -Os, 32 KB FLASH, 10 KB RAM.
+ */
+
+#include "main.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#define WIFI_SSID          "laveesh"
+#define WIFI_PASSWORD      "12345678"
+
+#define FLAME_ACTIVE_LOW   1
+#define SERVO_CLOSED_US    500U
+#define SERVO_OPEN_US      1500U
+#define PIR_WARMUP_MS      10000U
+
+#define EVENT_COUNT        15U
+#define RX_SIZE            2048U
+#define CHUNK              384U
+#define CLIENTS            5U
+
+/* 0 = automatic discovery. Otherwise use a verified 7-bit address. */
+#define LCD_FIXED_ADDRESS  0U
+
+#define RFID_CS            GPIO_PIN_4
+#define RFID_RST           GPIO_PIN_8
+#define FLAME_PIN          GPIO_PIN_10
+#define PIR_PIN            GPIO_PIN_11
+#define DHT_PIN            GPIO_PIN_0
+#define BUZZER_PIN         GPIO_PIN_1
+#define FAN_PIN            GPIO_PIN_8
+#define WATER_PIN          GPIO_PIN_9
+
+I2C_HandleTypeDef hi2c1;
+SPI_HandleTypeDef hspi1;
+TIM_HandleTypeDef htim2, htim3;
+UART_HandleTypeDef huart1;
+
+void SystemClock_Config(void);
+void Error_Handler(void);
+static void safety_task(void);
+
+static uint32_t ms(void)
+{
+    return HAL_GetTick();
+}
+
+static bool due(uint32_t t)
+{
+    return (int32_t)(ms() - t) >= 0;
+}
+
+static bool elapsed(uint32_t t, uint32_t n)
+{
+    return (uint32_t)(ms() - t) >= n;
+}
+
+static bool high(GPIO_TypeDef *p, uint16_t b)
+{
+    return (p->IDR & b) != 0;
+}
+
+static void out(GPIO_TypeDef *p, uint16_t b, bool on)
+{
+    p->BSRR = on ? (uint32_t)b : (uint32_t)b << 16;
+}
+
+static bool flame_input(void)
+{
+    return FLAME_ACTIVE_LOW
+        ? !high(GPIOB, FLAME_PIN)
+        : high(GPIOB, FLAME_PIN);
+}
+
+static void us(uint16_t n)
+{
+    uint16_t t = (uint16_t)TIM3->CNT;
+
+    while ((uint16_t)((uint16_t)TIM3->CNT - t) < n) {
+    }
+}
+
+static void gpio(GPIO_TypeDef *p, uint16_t b,
+                 uint32_t mode, uint32_t pull)
+{
+    GPIO_InitTypeDef g = {0};
+
+    g.Pin = b;
+    g.Mode = mode;
+    g.Pull = pull;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+
+    HAL_GPIO_Init(p, &g);
+}
+
+/* Small bounded formatter; avoids printf-family code. */
+
+typedef struct {
+    char *p;
+    unsigned n, cap;
+} Text;
+
+static Text text(char *p, unsigned cap)
+{
+    Text t = {p, 0, cap};
+
+    if (cap)
+        p[0] = 0;
+
+    return t;
+}
+
+static void ch(Text *t, char c)
+{
+    if (t->n + 1 < t->cap) {
+        t->p[t->n++] = c;
+        t->p[t->n] = 0;
+    }
+}
+
+static void put(Text *t, const char *s)
+{
+    while (*s)
+        ch(t, *s++);
+}
+
+static void num(Text *t, uint32_t v)
+{
+    char b[10];
+    unsigned n = 0;
+
+    do {
+        b[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+
+    while (n)
+        ch(t, b[--n]);
+}
+
+static void two(Text *t, unsigned v)
+{
+    ch(t, (char)('0' + v / 10 % 10));
+    ch(t, (char)('0' + v % 10));
+}
+
+static void hex8(Text *t, uint32_t v)
+{
+    for (int i = 28; i >= 0; i -= 4)
+        ch(t, "0123456789ABCDEF"[(v >> i) & 15]);
+}
+
+static void quoted(Text *t, const char *s)
+{
+    ch(t, '"');
+    put(t, s);
+    ch(t, '"');
+}
+
+typedef struct {
+    uint8_t y, mo, d, h, m, s;
+} Date;
+
+typedef struct {
+    uint32_t seq, up, uid;
+    Date date;
+    uint8_t who, method, result, valid;
+} Event;
+
+/*
+ * who:
+ *   0 unknown, 1 employee 1, 2 employee 2, 3 website, 4 system.
+ *
+ * method:
+ *   0 RFID, 1 PIN, 2 website, 3 fire, 4 PIR.
+ *
+ * result:
+ *   0 granted, 1 denied, 2 held, 3 closed,
+ *   4 alarm, 5 cleared, 6 blocked.
+ */
+
+static Event events[EVENT_COUNT];
+static uint32_t sequence;
+static Date date;
+
+static bool rtc_ok, dht_ok, bus_bad;
+static bool lcd_restart;
+static uint32_t rtc_at, dht_at;
+static unsigned temp10, hum10;
+
+static bool fire, fan, door, hold, timed;
+static bool motion, locked, pir_ready;
+static uint8_t fan_mode, motion_mode;
+
+static uint16_t start_min = 1290;
+static uint16_t end_min = 420;
+
+static uint32_t boot_at, door_until, alarm_at;
+static uint32_t fire_low_at, fan_low_at;
+
+static bool fire_wait, fan_wait;
+static bool pir_armed = true;
+static volatile uint8_t fire_latch;
+
+static char message[21];
+static char pin_value[5];
+static uint8_t pin_len;
+static bool granted, pin_overflow;
+static uint32_t message_at, pin_at;
+
+static bool online;
+static char ip[16];
+/* Startup gate: keep peripherals/sensors idle while Wi-Fi initializes. */
+static bool startup_started, startup_complete;
+static uint32_t startup_at;
+
+static bool clock_good(void)
+{
+    return rtc_ok && !elapsed(rtc_at, 2500);
+}
+
+static void date_put(Text *t, Date d)
+{
+    put(t, "20");
+    two(t, d.y);
+    ch(t, '-');
+    two(t, d.mo);
+    ch(t, '-');
+    two(t, d.d);
+    ch(t, ' ');
+    two(t, d.h);
+    ch(t, ':');
+    two(t, d.m);
+    ch(t, ':');
+    two(t, d.s);
+}
+
+static void log_event(uint8_t who, uint8_t method,
+                      uint8_t result, uint32_t uid)
+{
+    Event *e = &events[sequence % EVENT_COUNT];
+
+    e->seq = ++sequence;
+    e->up = ms() / 1000;
+    e->uid = uid;
+    e->date = date;
+    e->who = who;
+    e->method = method;
+    e->result = result;
+    e->valid = clock_good();
+}
+
+static void say(const char *s, bool ok)
+{
+    Text t = text(message, sizeof message);
+
+    put(&t, s);
+    message_at = ms();
+    granted = ok;
+}
+
+static void access(uint8_t who, uint8_t method, uint32_t uid)
+{
+    log_event(who, method, who ? 0 : 1, uid);
+
+    if (!who) {
+        say("Access Denied", false);
+        return;
+    }
+
+    say(who == 1 ? "Welcome Employee 1"
+                 : who == 2 ? "Welcome Employee 2"
+                            : "Welcome",
+        true);
+
+    if (!fire && !hold) {
+        timed = true;
+        door_until = ms() + 5000;
+    }
+}
+
+static bool monitoring(void)
+{
+    if (!pir_ready)
+        return false;
+
+    if (motion_mode)
+        return motion_mode == 1;
+
+    if (!clock_good())
+        return false;
+
+    unsigned m = date.h * 60U + date.m;
+
+    return start_min > end_min
+        ? (m >= start_min || m < end_min)
+        : (m >= start_min && m < end_min);
+}
+
+static const char *motion_status(void)
+{
+    if (!pir_ready)
+        return "Warming Up";
+
+    if (motion)
+        return "Detected!";
+
+    if (motion_mode == 2)
+        return "OFF";
+
+    if (!motion_mode && !clock_good())
+        return "Clock Error";
+
+    return monitoring() ? "Armed" : "Scheduled";
+}
+
+static const char *door_status(void)
+{
+    return fire ? "Emergency Open"
+         : hold ? "Held Open"
+         : door ? "Timed Access"
+                : "Closed";
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t p)
+{
+    if (p == FLAME_PIN && flame_input()) {
+        fire_latch = 1;
+
+        out(GPIOB, WATER_PIN, false);
+        out(GPIOB, FAN_PIN, true);
+        out(GPIOB, BUZZER_PIN, true);
+
+        TIM2->CCR1 = SERVO_OPEN_US;
+    }
+}
+
+static void safety_task(void)
+{
+    uint32_t n = ms();
+
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+
+    bool detected = fire_latch || flame_input();
+    fire_latch = 0;
+
+    __set_PRIMASK(mask);
+
+    if (detected) {
+        if (!fire) {
+            fire = true;
+            log_event(4, 3, 4, 0);
+        }
+
+        fire_wait = false;
+
+    } else if (fire) {
+        if (!fire_wait) {
+            fire_wait = true;
+            fire_low_at = n;
+        }
+
+        if (elapsed(fire_low_at, 2000)) {
+            fire = false;
+            fire_wait = false;
+            hold = false;
+            timed = false;
+
+            log_event(4, 3, 5, 0);
+        }
+    }
+
+    if (dht_ok && elapsed(dht_at, 6000))
+        dht_ok = false;
+
+    if (fire) {
+        fan = false;
+        fan_wait = false;
+
+    } else if (fan_mode) {
+        fan = fan_mode == 1;
+        fan_wait = false;
+
+    } else if (!dht_ok) {
+        fan = false;
+        fan_wait = false;
+
+    } else if (temp10 > 320) {
+        fan = true;
+        fan_wait = false;
+
+    } else if (temp10 == 320) {
+        fan_wait = false;
+
+    } else if (fan) {
+        if (!fan_wait) {
+            fan_wait = true;
+            fan_low_at = n;
+        }
+
+        if (elapsed(fan_low_at, 10000)) {
+            fan = false;
+            fan_wait = false;
+        }
+    }
+
+    if (!pir_ready && elapsed(boot_at, PIR_WARMUP_MS))
+        pir_ready = true;
+
+    bool pir = high(GPIOB, PIR_PIN);
+
+    if (locked && elapsed(alarm_at, 10000)) {
+        motion = false;
+        locked = false;
+    }
+
+    if (motion_mode == 2) {
+        motion = false;
+        locked = false;
+    }
+
+    if (!locked && !pir)
+        pir_armed = true;
+
+    if (monitoring() && !locked && pir && pir_armed) {
+        motion = true;
+        locked = true;
+        pir_armed = false;
+        alarm_at = n;
+
+        log_event(4, 4, 4, 0);
+    }
+
+    if (timed && due(door_until))
+        timed = false;
+
+    door = fire || hold || timed;
+
+    mask = __get_PRIMASK();
+    __disable_irq();
+
+    bool emergency = fire || fire_latch || flame_input();
+
+    TIM2->CCR1 = emergency || door
+               ? SERVO_OPEN_US : SERVO_CLOSED_US;
+
+    out(GPIOB, WATER_PIN, !emergency);
+    out(GPIOB, FAN_PIN, emergency || !fan);
+
+    out(GPIOB, BUZZER_PIN,
+        emergency || (motion && ((n - alarm_at) / 250) % 2 == 0));
+
+    __set_PRIMASK(mask);
+}
+
+/* DHT11 */
+
+static bool wait_level(bool v, uint16_t limit)
+{
+    uint16_t t = (uint16_t)TIM3->CNT;
+
+    while (high(GPIOB, DHT_PIN) != v) {
+        if ((uint16_t)((uint16_t)TIM3->CNT - t) >= limit)
+            return false;
+    }
+
+    return true;
+}
+
+static void dht_task(void)
+{
+    static bool started;
+    static uint32_t next = 2000, at;
+
+    if (!started) {
+        if (!due(next))
+            return;
+
+        gpio(GPIOB, DHT_PIN, GPIO_MODE_OUTPUT_OD, GPIO_PULLUP);
+        out(GPIOB, DHT_PIN, false);
+
+        at = ms();
+        started = true;
+        return;
+    }
+
+    if (!elapsed(at, 20))
+        return;
+
+    uint8_t b[5] = {0};
+    bool ok = true;
+
+    out(GPIOB, DHT_PIN, true);
+    gpio(GPIOB, DHT_PIN, GPIO_MODE_INPUT, GPIO_PULLUP);
+
+    if (!wait_level(false, 120) ||
+        !wait_level(true, 120) ||
+        !wait_level(false, 120))
+        ok = false;
+
+    for (unsigned i = 0; i < 40 && ok; i++) {
+        if (!wait_level(true, 100)) {
+            ok = false;
+            break;
+        }
+
+        uint16_t t = (uint16_t)TIM3->CNT;
+
+        if (!wait_level(false, 120)) {
+            ok = false;
+            break;
+        }
+
+        b[i / 8] = (uint8_t)(
+            (b[i / 8] << 1) |
+            ((uint16_t)((uint16_t)TIM3->CNT - t) > 48));
+    }
+
+    ok = ok &&
+         (uint8_t)(b[0] + b[1] + b[2] + b[3]) == b[4] &&
+         b[0] <= 100 &&
+         b[2] <= 80 &&
+         b[1] <= 9 &&
+         b[3] <= 9;
+
+    dht_ok = ok;
+
+    if (ok) {
+        hum10 = b[0] * 10U + b[1];
+        temp10 = b[2] * 10U + b[3];
+        dht_at = ms();
+    }
+
+    started = false;
+    next = ms() + 2000;
+}
+
+/* Shared LCD / RTC I2C bus */
+
+static bool bus_ready(void)
+{
+    if (bus_bad)
+        return false;
+
+    /*
+     * HAL may return after setting STOP but before STOP completes.
+     * Allow the hardware to settle instead of treating that as a fault.
+     */
+    uint16_t t = (uint16_t)TIM3->CNT;
+
+    for (;;) {
+        if (!(I2C1->CR1 & I2C_CR1_STOP) &&
+            !(I2C1->SR2 & I2C_SR2_BUSY) &&
+            high(GPIOB, GPIO_PIN_6) &&
+            high(GPIOB, GPIO_PIN_7)) {
+
+            us(5);
+            return true;
+        }
+
+        if ((uint16_t)((uint16_t)TIM3->CNT - t) >= 1000) {
+            bus_bad = true;
+            return false;
+        }
+    }
+}
+
+static bool bus_result(HAL_StatusTypeDef s)
+{
+    uint32_t error = HAL_I2C_GetError(&hi2c1);
+
+    if (s == HAL_TIMEOUT ||
+        s == HAL_BUSY ||
+        (error & (HAL_I2C_ERROR_BERR |
+                  HAL_I2C_ERROR_ARLO |
+                  HAL_I2C_ERROR_OVR |
+                  HAL_I2C_ERROR_TIMEOUT))) {
+        bus_bad = true;
+    }
+
+    /* An absent device's address NACK alone is not a bus fault. */
+    bool idle = bus_ready();
+
+    return s == HAL_OK && idle;
+}
+
+static bool iwrite(uint8_t a, uint8_t *b, uint16_t n)
+{
+    return bus_ready() &&
+           bus_result(HAL_I2C_Master_Transmit(
+               &hi2c1, (uint16_t)a << 1, b, n, 4));
+}
+
+static bool rtc_io(bool write, uint8_t reg,
+                   uint8_t *b, uint8_t n)
+{
+    if (!bus_ready())
+        return false;
+
+    return bus_result(
+        write
+            ? HAL_I2C_Mem_Write(
+                &hi2c1, 0xD0, reg, I2C_MEMADD_SIZE_8BIT, b, n, 4)
+            : HAL_I2C_Mem_Read(
+                &hi2c1, 0xD0, reg, I2C_MEMADD_SIZE_8BIT, b, n, 4));
+}
+
+static bool bus_pin(uint16_t p, bool level)
+{
+    uint16_t t = (uint16_t)TIM3->CNT;
+
+    while (high(GPIOB, p) != level) {
+        if ((uint16_t)((uint16_t)TIM3->CNT - t) >= 500)
+            return false;
+    }
+
+    us(5);
+    return true;
+}
+
+static void bus_task(void)
+{
+    static uint32_t next;
+
+    if (!bus_bad || !due(next))
+        return;
+
+    next = ms() + 1000;
+
+    lcd_restart = true;
+    rtc_ok = false;
+
+    __HAL_I2C_DISABLE(&hi2c1);
+
+    out(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, true);
+
+    gpio(GPIOB, GPIO_PIN_6 | GPIO_PIN_7,
+         GPIO_MODE_OUTPUT_OD, GPIO_NOPULL);
+
+    bool ok = bus_pin(GPIO_PIN_6, true);
+
+    /* Release a slave that may be waiting for remaining clocks. */
+    for (unsigned i = 0;
+         i < 9 && ok && !high(GPIOB, GPIO_PIN_7);
+         i++) {
+
+        out(GPIOB, GPIO_PIN_6, false);
+        us(5);
+
+        out(GPIOB, GPIO_PIN_6, true);
+        ok = bus_pin(GPIO_PIN_6, true);
+    }
+
+    if (ok)
+        ok = bus_pin(GPIO_PIN_7, true);
+
+    /*
+     * STM32F1 filter-unlock sequence:
+     * SDA low, SCL low, SCL high, SDA high.
+     */
+    if (ok) {
+        out(GPIOB, GPIO_PIN_7, false);
+        ok = bus_pin(GPIO_PIN_7, false);
+    }
+
+    if (ok) {
+        out(GPIOB, GPIO_PIN_6, false);
+        ok = bus_pin(GPIO_PIN_6, false);
+    }
+
+    if (ok) {
+        out(GPIOB, GPIO_PIN_6, true);
+        ok = bus_pin(GPIO_PIN_6, true);
+    }
+
+    out(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, true);
+
+    if (ok)
+        ok = bus_pin(GPIO_PIN_7, true);
+
+    gpio(GPIOB, GPIO_PIN_6 | GPIO_PIN_7,
+         GPIO_MODE_AF_OD, GPIO_NOPULL);
+
+    SET_BIT(I2C1->CR1, I2C_CR1_SWRST);
+    us(5);
+    CLEAR_BIT(I2C1->CR1, I2C_CR1_SWRST);
+
+    hi2c1.State = HAL_I2C_STATE_RESET;
+    hi2c1.Lock = HAL_UNLOCKED;
+
+    HAL_StatusTypeDef s = HAL_I2C_Init(&hi2c1);
+
+    bus_bad = !ok || s != HAL_OK;
+
+    if (!bus_bad)
+        (void)bus_ready();
+}
+
+/* DS3231 */
+
+static uint8_t bcd(unsigned v)
+{
+    return (uint8_t)(v / 10 * 16 + v % 10);
+}
+
+static uint8_t dec(uint8_t v)
+{
+    return (uint8_t)((v >> 4) * 10 + (v & 15));
+}
+
+static unsigned month_days(unsigned y, unsigned m)
+{
+    static const uint8_t d[] = {
+        31, 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31
+    };
+
+    return d[m - 1] + (m == 2 && y % 4 == 0);
+}
+
+static bool date_valid(Date d)
+{
+    return d.y <= 99 &&
+           d.mo >= 1 && d.mo <= 12 &&
+           d.d >= 1 && d.d <= month_days(d.y, d.mo) &&
+           d.h < 24 && d.m < 60 && d.s < 60;
+}
+
+static void rtc_task(void)
+{
+    static uint32_t next;
+
+    if (!due(next))
+        return;
+
+    next = ms() + 1000;
+
+    uint8_t b[7], s;
+    rtc_ok = false;
+
+    if (!rtc_io(false, 0, b, 7) ||
+        !rtc_io(false, 15, &s, 1) ||
+        (s & 128) ||
+        (b[5] & 128))
+        return;
+
+    for (unsigned i = 0; i < 7; i++) {
+        if (i != 3 && (b[i] & 15) > 9)
+            return;
+    }
+
+    Date d = {
+        dec(b[6]),
+        dec(b[5] & 31),
+        dec(b[4] & 63),
+        0,
+        dec(b[1] & 127),
+        dec(b[0] & 127)
+    };
+
+    if (b[2] & 64) {
+        unsigned h = dec(b[2] & 31);
+
+        if (!h || h > 12)
+            return;
+
+        d.h = h % 12 + ((b[2] & 32) ? 12 : 0);
+    } else {
+        d.h = dec(b[2] & 63);
+    }
+
+    if (date_valid(d)) {
+        date = d;
+        rtc_at = ms();
+        rtc_ok = true;
+    }
+}
+
+static bool digits(const char *s, unsigned n)
+{
+    if (strlen(s) != n)
+        return false;
+
+    while (*s) {
+        if (*s < '0' || *s > '9')
+            return false;
+
+        s++;
+    }
+
+    return true;
+}
+
+static unsigned pair(const char *s)
+{
+    return (unsigned)(s[0] - '0') * 10 +
+           (unsigned)(s[1] - '0');
+}
+
+static bool set_clock(const char *s)
+{
+    if (!digits(s, 14) || s[0] != '2' || s[1] != '0')
+        return false;
+
+    Date d = {
+        (uint8_t)pair(s + 2),
+        (uint8_t)pair(s + 4),
+        (uint8_t)pair(s + 6),
+        (uint8_t)pair(s + 8),
+        (uint8_t)pair(s + 10),
+        (uint8_t)pair(s + 12)
+    };
+
+    if (!date_valid(d))
+        return false;
+
+    unsigned days = 0;
+
+    for (unsigned y = 0; y < d.y; y++)
+        days += 365 + (y % 4 == 0);
+
+    for (unsigned m = 1; m < d.mo; m++)
+        days += month_days(d.y, m);
+
+    uint8_t b[] = {
+        bcd(d.s),
+        bcd(d.m),
+        bcd(d.h),
+        (uint8_t)((days + d.d + 5) % 7 + 1),
+        bcd(d.d),
+        bcd(d.mo),
+        bcd(d.y)
+    };
+
+    uint8_t c, status;
+
+    if (!rtc_io(false, 14, &c, 1) ||
+        !rtc_io(false, 15, &status, 1))
+        return false;
+
+    c &= 127;
+    status &= 127;
+
+    if (!rtc_io(true, 0, b, 7) ||
+        !rtc_io(true, 14, &c, 1) ||
+        !rtc_io(true, 15, &status, 1))
+        return false;
+
+    date = d;
+    rtc_at = ms();
+    rtc_ok = true;
+
+    return true;
+}
+
+/*
+ * LCD backpack mapping:
+ * RS=P0, RW=P1, E=P2, BL=P3, D4-D7=P4-P7.
+ */
+
+static uint8_t lcd_addr, lcd_state;
+static char want[4][20], have[4][20];
+
+static bool lcd_nibble(uint8_t n, bool rs)
+{
+    uint8_t v = (uint8_t)((n << 4) | 8 | rs);
+    uint8_t b[] = {v, (uint8_t)(v | 4), v};
+
+    return iwrite(lcd_addr, b, 3);
+}
+
+static bool lcd_byte(uint8_t v, bool rs)
+{
+    uint8_t a = (uint8_t)((v & 240) | 8 | rs);
+    uint8_t b = (uint8_t)((v << 4) | 8 | rs);
+
+    uint8_t data[] = {
+        a, (uint8_t)(a | 4), a,
+        b, (uint8_t)(b | 4), b
+    };
+
+    bool ok = iwrite(lcd_addr, data, 6);
+
+    if (ok)
+        us(60);
+
+    return ok;
+}
+
+static void row(unsigned r, const char *s, bool centre)
+{
+    unsigned n = (unsigned)strlen(s);
+
+    if (n > 20)
+        n = 20;
+
+    memset(want[r], ' ', 20);
+    memcpy(want[r] + (centre ? (20 - n) / 2 : 0), s, n);
+}
+
+static void display_task(void)
+{
+    static uint32_t next;
+    static uint32_t ip_screen_at;
+    static bool ip_screen_started;
+    static char startup_ip[16];
+
+    if (!due(next))
+        return;
+    next = ms() + 100;
+
+    /* Startup is deliberately gated: sensors do not run until a real IP has
+       been captured and displayed for six seconds. Keep the title screen for
+       at least ten seconds while Wi-Fi setup continues in wifi_task(). */
+    if (!startup_started && lcd_state >= 8) {
+        startup_started = true;
+        startup_at = ms();
+    }
+
+    if (startup_started && !startup_complete && !ip_screen_started &&
+        elapsed(startup_at, 10000) && ip[0] != '\0' &&
+        strcmp(ip, "0.0.0.0") != 0) {
+        memcpy(startup_ip, ip, sizeof startup_ip);
+        startup_ip[sizeof startup_ip - 1] = '\0';
+        ip_screen_started = true;
+        ip_screen_at = ms();
+    }
+
+    if (ip_screen_started && !startup_complete &&
+        elapsed(ip_screen_at, 6000)) {
+        startup_complete = true;
+    }
+
+    for (unsigned r = 0; r < 4; r++)
+        row(r, "", false);
+
+    if (!startup_started || !startup_complete) {
+        row(1, "SMART OFFICE", true);
+        row(2, "AUTOMATION", true);
+
+        if (ip_screen_started && !elapsed(ip_screen_at, 6000)) {
+            char b[32];
+            Text t = text(b, sizeof b);
+            put(&t, "IP: ");
+            put(&t, startup_ip);
+            row(3, b, true);
+        } else if (ip[0] != '\0' && strcmp(ip, "0.0.0.0") != 0 &&
+                   !elapsed(startup_at, 10000)) {
+            row(3, "WiFi connected", true);
+        } else {
+            row(3, "Connecting WiFi...", true);
+        }
+        return;
+    }
+
+    char b[32];
+    Text t = text(b, sizeof b);
+
+    if (fire) {
+        row(0, "Emergency Door Open", false);
+    } else if (pin_len || pin_overflow) {
+        put(&t, "Enter PIN: ");
+        for (unsigned i = 0; i < pin_len; i++)
+            ch(&t, '*');
+        if (pin_overflow)
+            ch(&t, '!');
+        row(0, b, false);
+    } else if (message[0] &&
+               !elapsed(message_at, granted ? 3000 : 2000)) {
+        row(0,
+            granted && !elapsed(message_at, 1000)
+                ? "Access Granted" : message,
+            false);
+    } else {
+        row(0, hold ? "Door: Held Open" : "Scan RFID/Enter PIN", false);
+    }
+
+    row(1,
+        fire
+            ? ((ms() / 1500) % 2
+                   ? "Sprinkler: ON" : "FIRE ALERT: EVACUATE")
+            : "No Flame Detected",
+        false);
+
+    t = text(b, sizeof b);
+    put(&t, "T:");
+    if (dht_ok)
+        num(&t, temp10 / 10);
+    else
+        put(&t, "--");
+    put(&t, "C H:");
+    if (dht_ok)
+        num(&t, hum10 / 10);
+    else
+        put(&t, "--");
+    put(&t, "% Fan:");
+    put(&t, fan ? "ON" : "OFF");
+    row(2, b, false);
+
+    t = text(b, sizeof b);
+    put(&t, "Motion: ");
+    put(&t, motion_status());
+    row(3, b, false);
+}
+static void lcd_task(void)
+{
+    static uint32_t next;
+    static uint8_t scan, r, c;
+
+    static const uint8_t offsets[] = {
+        0, 0x40, 0x14, 0x54
+    };
+
+    if (lcd_restart) {
+        lcd_restart = false;
+        lcd_state = 0;
+        r = 0;
+        c = 0;
+
+        memset(have, 0, sizeof have);
+        next = ms() + 100;
+    }
+
+    if (!due(next))
+        return;
+
+    next = ms() + 3;
+
+    if (!lcd_state) {
+        if (!bus_ready()) {
+            next = ms() + 250;
+            return;
+        }
+
+        lcd_addr = LCD_FIXED_ADDRESS
+                 ? LCD_FIXED_ADDRESS
+                 : scan == 0 ? 0x27
+                 : scan == 1 ? 0x3F
+                 : scan < 10 ? 0x20 + scan - 2
+                             : 0x38 + scan - 10;
+
+        scan = (scan + 1) % 18;
+
+        if (!bus_result(HAL_I2C_IsDeviceReady(
+                &hi2c1, (uint16_t)lcd_addr << 1, 1, 3))) {
+            next = ms() + 100;
+            return;
+        }
+
+        /* Backlight on; E, RW and RS low before initialization. */
+        uint8_t idle = 8;
+
+        if (!iwrite(lcd_addr, &idle, 1)) {
+            next = ms() + 250;
+            return;
+        }
+
+        lcd_state = 1;
+        next = ms() + 100;
+        return;
+    }
+
+    bool ok;
+
+    if (lcd_state <= 3) {
+        ok = lcd_nibble(3, false);
+        next = ms() + 5;
+
+    } else if (lcd_state == 4) {
+        ok = lcd_nibble(2, false);
+
+    } else if (lcd_state == 5) {
+        ok = lcd_byte(0x28, false);
+
+    } else if (lcd_state == 6) {
+        ok = lcd_byte(0x0C, false);
+
+    } else if (lcd_state == 7) {
+        ok = lcd_byte(0x06, false) &&
+             lcd_byte(1, false);
+
+        memset(have, 0, sizeof have);
+
+    } else {
+        ok = true;
+
+        for (unsigned i = 0; i < 80; i++) {
+            if (want[r][c] != have[r][c]) {
+                char v = want[r][c] ? want[r][c] : ' ';
+
+                ok = lcd_byte(
+                         (uint8_t)(0x80 + offsets[r] + c), false) &&
+                     lcd_byte((uint8_t)v, true);
+
+                if (ok)
+                    have[r][c] = v;
+
+                break;
+            }
+
+            if (++c == 20) {
+                c = 0;
+                r = (r + 1) % 4;
+            }
+        }
+    }
+
+    if (!ok) {
+        lcd_state = 0;
+        next = ms() + 1000;
+
+    } else if (lcd_state < 8) {
+        lcd_state++;
+    }
+}
+
+/* Keypad */
+
+static void keypad_task(void)
+{
+    static uint32_t next, changed;
+    static char candidate, stable;
+
+    static const uint16_t rows[] = {
+        GPIO_PIN_2, GPIO_PIN_3, GPIO_PIN_3, GPIO_PIN_4
+    };
+
+    static const uint16_t cols[] = {
+        GPIO_PIN_5, GPIO_PIN_12, GPIO_PIN_13, GPIO_PIN_14
+    };
+
+    static const char keys[4][4] = {
+        {'1', '2', '3', 'A'},
+        {'4', '5', '6', 'B'},
+        {'7', '8', '9', 'C'},
+        {'*', '0', '#', 'D'}
+    };
+
+    if ((pin_len || pin_overflow) && elapsed(pin_at, 10000)) {
+        pin_len = 0;
+        pin_overflow = false;
+        pin_value[0] = 0;
+    }
+
+    if (!due(next))
+        return;
+
+    next = ms() + 10;
+
+    char key = 0;
+    unsigned count = 0;
+
+    for (unsigned r = 0; r < 4; r++) {
+        GPIO_TypeDef *p = r < 2 ? GPIOA : GPIOB;
+
+        out(p, rows[r], false);
+        us(4);
+
+        for (unsigned c = 0; c < 4; c++) {
+            if (!high(GPIOB, cols[c])) {
+                key = keys[r][c];
+                count++;
+            }
+        }
+
+        out(p, rows[r], true);
+    }
+
+    if (count > 1)
+        key = 0;
+
+    if (candidate != key) {
+        candidate = key;
+        changed = ms();
+    }
+
+    if (!elapsed(changed, 30) || stable == candidate)
+        return;
+
+    stable = candidate;
+
+    if (!stable)
+        return;
+
+    pin_at = ms();
+
+    if (stable == '*') {
+        pin_len = 0;
+        pin_overflow = false;
+        pin_value[0] = 0;
+        message[0] = 0;
+
+    } else if (stable == '#') {
+        uint8_t id = 0;
+
+        if (!pin_overflow && pin_len == 4) {
+            id = !strcmp(pin_value, "2026") ? 1
+               : !strcmp(pin_value, "2025") ? 2 : 0;
+        }
+
+        access(id, 1, 0);
+
+        pin_len = 0;
+        pin_overflow = false;
+        pin_value[0] = 0;
+
+    } else if (stable >= '0' && stable <= '9') {
+        if (pin_len < 4 && !pin_overflow) {
+            pin_value[pin_len++] = stable;
+            pin_value[pin_len] = 0;
+        } else {
+            pin_overflow = true;
+        }
+    }
+}
+
+/* Entry RC522 reader */
+
+static bool spi_ok;
+
+static uint8_t rf_reg(uint8_t reg, uint8_t value, bool read)
+{
+    if (!spi_ok)
+        return 0;
+
+    uint8_t tx[] = {
+        (uint8_t)(((reg << 1) & 0x7E) | (read ? 128 : 0)),
+        value
+    };
+
+    uint8_t rx[2] = {0};
+
+    out(GPIOA, RFID_CS, false);
+
+    HAL_StatusTypeDef s =
+        HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, 2);
+
+    out(GPIOA, RFID_CS, true);
+
+    if (s != HAL_OK)
+        spi_ok = false;
+
+    return rx[1];
+}
+
+static void rw(uint8_t reg, uint8_t v)
+{
+    (void)rf_reg(reg, v, false);
+}
+
+static uint8_t rr(uint8_t reg)
+{
+    return rf_reg(reg, 0, true);
+}
+
+static void rf_start(const uint8_t *b, unsigned n, uint8_t bits)
+{
+    rw(1, 0);
+    rw(4, 127);
+    rw(10, 128);
+
+    while (n--)
+        rw(9, *b++);
+
+    rw(13, bits);
+    rw(1, 12);
+    rw(13, bits | 128);
+}
+
+static int rf_result(uint8_t *b, unsigned cap)
+{
+    uint8_t irq = rr(4);
+
+    if (!spi_ok)
+        return -1;
+
+    if (!(irq & 0x31))
+        return 0;
+
+    rw(13, 0);
+
+    if ((irq & 1) || (rr(6) & 0x1B))
+        return -1;
+
+    unsigned n = rr(10);
+
+    if (!n || n > cap || (rr(12) & 7))
+        return -1;
+
+    for (unsigned i = 0; i < n; i++)
+        b[i] = rr(9);
+
+    return spi_ok ? (int)n : -1;
+}
+
+static void rfid_task(void)
+{
+    static uint8_t stage, miss;
+    static bool present;
+    static uint32_t next, deadline;
+
+    uint8_t b[10];
+
+    if (stage < 4 && !due(next))
+        return;
+
+    if (stage == 0) {
+        spi_ok = true;
+
+        out(GPIOA, RFID_CS, true);
+        out(GPIOA, RFID_RST, false);
+
+        stage = 1;
+        next = ms() + 2;
+        return;
+    }
+
+    if (stage == 1) {
+        out(GPIOA, RFID_RST, true);
+
+        stage = 2;
+        next = ms() + 60;
+        return;
+    }
+
+    if (stage == 2) {
+        spi_ok = true;
+
+        uint8_t v = rr(0x37);
+
+        if (!spi_ok || !v || v == 255) {
+            stage = 0;
+            next = ms() + 3000;
+            return;
+        }
+
+        rw(0x2A, 0x80);
+        rw(0x2B, 0xA9);
+        rw(0x2C, 0);
+        rw(0x2D, 200);
+        rw(0x15, 0x40);
+        rw(0x11, 0x3D);
+        rw(0x26, 0x70);
+        rw(0x14, 0x83);
+
+        if (!spi_ok) {
+            stage = 0;
+            next = ms() + 3000;
+            return;
+        }
+
+        stage = 3;
+        next = ms() + 10;
+        return;
+    }
+
+    if (stage == 3) {
+        b[0] = 0x52;
+        rf_start(b, 1, 7);
+
+        stage = 4;
+        deadline = ms() + 15;
+        return;
+    }
+
+    int n = rf_result(b, sizeof b);
+
+    if (!n && !due(deadline))
+        return;
+
+    if (stage == 4 && n == 2) {
+        miss = 0;
+
+        if (!present) {
+            b[0] = 0x93;
+            b[1] = 0x20;
+            rf_start(b, 2, 0);
+
+            stage = 5;
+            deadline = ms() + 15;
+            return;
+        }
+
+    } else if (stage == 5 && n == 5 &&
+               (uint8_t)(b[0] ^ b[1] ^ b[2] ^ b[3]) == b[4]) {
+
+        uint32_t uid =
+            ((uint32_t)b[0] << 24) |
+            ((uint32_t)b[1] << 16) |
+            ((uint32_t)b[2] << 8) |
+            b[3];
+
+        uint8_t id = uid == 0x9A6E3B1DUL ? 1
+                   : uid == 0xDA3C441DUL ? 2 : 0;
+
+        if (b[0] == 0x88)
+            id = 0;
+
+        access(id, 0, uid);
+
+        present = true;
+        miss = 0;
+
+    } else if (stage == 4) {
+        if (miss < 3)
+            miss++;
+
+        if (miss >= 3)
+            present = false;
+    }
+
+    rw(1, 0);
+    rw(0x14, 0x80);
+
+    if (!spi_ok) {
+        out(GPIOA, RFID_RST, false);
+
+        stage = 0;
+        next = ms() + 3000;
+    } else {
+        stage = 2;
+        next = ms() + 180;
+    }
+}
+
+/* Compact website stored in flash */
+
+static const char page[] =
+"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Smart Office</title>"
+"<link rel=icon href='data:,'><style>"
+"*{box-sizing:border-box}body{margin:0;background:#edf2f7;color:#18334c;font:15px system-ui}"
+"header{padding:24px;background:#16354e;color:white}h1{margin:0}main{max-width:1000px;margin:auto;padding:18px}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}"
+"section{background:white;padding:20px;border-radius:14px;margin-bottom:14px;box-shadow:0 4px 16px #1231}"
+"h2{font-size:18px;margin:0 0 14px}b{display:block;font-size:23px;margin:12px 0}"
+"button,input{font:inherit;padding:9px;border:1px solid #ccd8e2;border-radius:7px;margin:3px}"
+"button{background:#176a7b;color:white;cursor:pointer}button:disabled{opacity:.4}small{color:#526b7d}"
+"#alert{background:#ffe0df;color:#9d1919;padding:16px;border-radius:10px}#note{min-height:24px}"
+"table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:9px;text-align:left;border-bottom:1px solid #ddd;white-space:nowrap}"
+".scroll{overflow:auto;max-height:360px}</style>"
+"<header><h1>Smart Office</h1><p>Access &middot; Climate &middot; Safety</p><div id=link>Connecting...</div></header>"
+"<main><p id=alert hidden>FIRE ALERT: Evacuate. Door open, sprinkler ON, fan OFF.</p><p id=note role=status></p>"
+"<div class=grid><section><h2>Door access</h2><b id=door>--</b>"
+"<button data-c=entry>Entry access</button><button data-c=open>Hold open</button><button data-c=close id=close>Close</button>"
+"<p><small>Entry opens for 5 seconds. Hold stays open.</small></p></section>"
+"<section><h2>Fire &amp; sprinkler</h2><b id=fire>--</b><p id=water>--</p><small>Sprinkler status reports its relay command.</small></section>"
+"<section><h2>Office climate</h2><b id=climate>--</b><button data-c=fan_on id=fanon>Fan ON</button><button data-c=fan_off>Fan OFF</button><button data-c=fan_auto>Auto</button>"
+"<p><small>Auto: ON above 32 C; OFF after 10 s below.</small></p></section>"
+"<section><h2>Motion monitoring</h2><b id=motion>--</b><p id=mode></p><button data-c=motion_auto>Auto</button><button data-c=motion_on>ON</button><button data-c=motion_off>OFF</button>"
+"<p><label>From <input id=a type=time value=21:30></label><label>To <input id=z type=time value=07:00></label><button id=save>Save hours</button></p><small id=hours></small></section></div>"
+"<section><h2>Office clock</h2><p id=clock>--</p><input id=dt type=datetime-local step=1><button id=set>Set date/time</button><p><small>Local time. Modes and schedule reset on restart.</small></p></section>"
+"<section><h2>Recent events</h2><input id=q placeholder='Search events' aria-label='Search events'><div class=scroll><table><thead><tr><th>#</th><th>Time</th><th>Person</th><th>Action</th><th>Method</th><th>Result</th><th>Card</th></tr></thead><tbody id=rows></tbody></table></div>"
+"<p><small>Latest 15 session events. Access records are authorisations.</small></p></section></main><script>"
+"const $=x=>document.getElementById(x);let queue=Promise.resolve(),logs=[],last=-1,up=-1;"
+"function serial(f){let p=queue.then(f);queue=p.catch(()=>{});return p}"
+"async function api(p,post=false){let c=new AbortController(),t=setTimeout(()=>c.abort(),18000);try{let r=await fetch(p,{method:post?'POST':'GET',cache:'no-store',signal:c.signal});if(!r.ok)throw Error();return await r.json()}finally{clearTimeout(t)}}"
+"function offline(){$('link').textContent='Disconnected - displayed values may be stale'}"
+"async function cmd(c,v=''){try{let r=await serial(()=>api('/cmd?x='+c+'&v='+encodeURIComponent(v),true));$('note').textContent=r.message;if(r.ok)last=-1}catch(e){offline();$('note').textContent='Command not confirmed. Check actual state.'}}"
+"document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>cmd(b.dataset.c));"
+"$('save').onclick=()=>{if($('a').value&&$('z').value)cmd('schedule',($('a').value+$('z').value).replace(/:/g,''))};"
+"$('set').onclick=()=>{let v=$('dt').value;if(v.length==16)v+=':00';if(v)cmd('clock',v.replace(/[-:T]/g,''))};"
+"function render(){$('rows').replaceChildren();for(let r of [...logs].reverse()){let a=[r[0],r[1]||('No clock / '+r[7]+' s'),['Unknown','Employee 1','Employee 2','Website operator','System'][r[2]],r[4]<2?'Entry':'System / control',['RFID','Keypad','Website','Fire','PIR'][r[3]],['Granted','Denied','Held open','Closed','Alarm','Cleared','Blocked'][r[4]],r[5]||'--'];if(!a.join(' ').toLowerCase().includes($('q').value.toLowerCase()))continue;let tr=document.createElement('tr');for(let x of a){let td=document.createElement('td');td.textContent=x;tr.append(td)}$('rows').append(tr)}}$('q').oninput=render;"
+"async function update(){try{await serial(async()=>{let s=await api('/status');if(s.up<up)last=-1;up=s.up;"
+"$('link').textContent='Connected | '+s.ip+' | Updated '+new Date().toLocaleTimeString();$('door').textContent=s.door;$('alert').hidden=!s.fire;"
+"$('fire').textContent=s.fire?'FIRE ALERT':'No flame detected';$('water').textContent='Sprinkler: '+(s.fire?'ON':'OFF');"
+"$('climate').textContent=s.t===null?'Sensor unavailable':s.t/10+' C / '+s.h/10+'% RH';$('motion').textContent=s.motion;$('mode').textContent='Mode: '+['Auto','ON','OFF'][s.mm];$('clock').textContent=s.clock;$('close').disabled=$('fanon').disabled=!!s.fire;"
+"let fmt=m=>String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');$('hours').textContent='Current: '+fmt(s.start)+' - '+fmt(s.end);"
+"if(last!==s.seq){logs=await api('/events');render();last=s.seq}})}catch(e){offline()}finally{setTimeout(update,1800)}}update();</script>";
+
+/* ESP-01 UART receiver: circular DMA, polled from the main loop.
+   USART1 RX and DMA interrupts are not used. DMA1 Channel 5 is reserved
+   for USART1_RX. Keep RX_SIZE a power of two. */
+
+static volatile uint8_t rx_ring[RX_SIZE];
+static uint16_t rx_tail;
+static volatile uint8_t rx_fault;
+static uint8_t rx_started;
+
+static void uart_rx_start(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    /* TX uses blocking HAL_UART_Transmit(), so USART1 IRQ is unnecessary. */
+    HAL_NVIC_DisableIRQ(USART1_IRQn);
+    HAL_NVIC_DisableIRQ(DMA1_Channel5_IRQn);
+
+    USART1->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_PEIE | USART_CR1_IDLEIE);
+    USART1->CR3 &= ~(USART_CR3_EIE | USART_CR3_DMAR);
+
+    DMA1_Channel5->CCR = 0;
+    DMA1->IFCR = DMA_IFCR_CGIF5;
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+    __HAL_UART_CLEAR_FEFLAG(&huart1);
+    __HAL_UART_CLEAR_NEFLAG(&huart1);
+    __HAL_UART_CLEAR_PEFLAG(&huart1);
+
+    DMA1_Channel5->CPAR = (uint32_t)(uintptr_t)&USART1->DR;
+    DMA1_Channel5->CMAR = (uint32_t)(uintptr_t)rx_ring;
+    DMA1_Channel5->CNDTR = RX_SIZE;
+    DMA1_Channel5->CCR = DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_PL_1;
+    DMA1_Channel5->CCR |= DMA_CCR_EN;
+    USART1->CR3 |= USART_CR3_DMAR;
+
+    rx_tail = 0;
+    rx_started = 1;
+}
+
+typedef struct {
+    char line[96];
+    uint16_t used, total;
+    uint8_t state, end;
+    bool first;
+    uint32_t at;
+} Client;
+
+static Client clients[CLIENTS];
+
+static char at_line[160];
+static char at_command[128];
+static char buffer[CHUNK];
+
+static unsigned at_used;
+static uint32_t ipd_left, ipd_started;
+static uint8_t ipd_id, flags;
+static bool ip_seen;
+volatile uint32_t wifi_restarts, wifi_rx_faults, wifi_health_failures;
+
+enum {
+    A_OK = 1,
+    A_ERROR = 2,
+    A_PROMPT = 4,
+    A_SENT = 8,
+    A_READY = 16,
+    A_DOWN = 32
+};
+
+static int client = -1;
+static uint8_t kind, phase;
+static uint32_t offset, log_next, log_end;
+static bool comma, reply_ok;
+static const char *reply;
+
+static void client_byte(Client *c, char x)
+{
+    if (c->state >= 2)
+        return;
+
+    if (!c->state) {
+        memset(c, 0, sizeof *c);
+        c->state = 1;
+        c->first = true;
+        c->at = ms();
+    }
+
+    if (++c->total > 4096) {
+        c->line[0] = 0;
+        c->state = 2;
+        return;
+    }
+
+    if (c->first) {
+        if (x == '\r' || x == '\n') {
+            c->line[c->used] = 0;
+            c->first = false;
+
+        } else if (c->used < sizeof c->line - 1) {
+            c->line[c->used++] = x;
+
+        } else {
+            c->line[0] = 0;
+            c->state = 2;
+            return;
+        }
+    }
+
+    static const char end[] = "\r\n\r\n";
+
+    if (x == end[c->end])
+        c->end++;
+    else
+        c->end = x == '\r' ? 1 : 0;
+
+    if (c->end == 4)
+        c->state = 2;
+}
+
+static void at_received(void)
+{
+    if (!strcmp(at_line, "OK"))
+        flags |= A_OK;
+
+    if (!strcmp(at_line, "ERROR") ||
+        !strcmp(at_line, "FAIL") ||
+        strstr(at_line, "SEND FAIL") ||
+        strstr(at_line, "busy"))
+        flags |= A_ERROR;
+
+    if (!strcmp(at_line, "SEND OK"))
+        flags |= A_SENT;
+
+    if (!strcmp(at_line, "ready"))
+        flags |= A_READY;
+
+    if (strstr(at_line, "WIFI DISCONNECT")) {
+        flags |= A_DOWN;
+        online = false;
+        ip[0] = 0;
+    }
+
+    /* ESP-01 normally returns +CIFSR:STAIP,"a.b.c.d". Accept the STAIP
+       field wherever it appears in the received response line. */
+    char *p = strstr(at_line, "STAIP,");
+    if (p) {
+        p += 6;
+        while (*p == ' ' || *p == '\"')
+            p++;
+
+        unsigned n = 0;
+        while (p[n] && p[n] != '\"' && p[n] != ',' &&
+               p[n] != ' ' && n < 15)
+            n++;
+
+        bool valid = n > 6 && n < 16;
+        unsigned dots = 0;
+        for (unsigned i = 0; i < n; i++) {
+            if (p[i] == '.') dots++;
+            else if (p[i] < '0' || p[i] > '9') valid = false;
+        }
+        if (dots != 3) valid = false;
+
+        if (valid) {
+            ip_seen = true;
+            memcpy(ip, p, n);
+            ip[n] = 0;
+            if (!strcmp(ip, "0.0.0.0")) ip[0] = 0;
+        }
+    }
+
+    if (at_line[0] >= '0' &&
+        at_line[0] < '0' + CLIENTS &&
+        at_line[1] == ',') {
+
+        unsigned id = (unsigned)(at_line[0] - '0');
+
+        if (!strcmp(at_line + 2, "CONNECT")) {
+            memset(&clients[id], 0, sizeof clients[id]);
+            clients[id].at = ms();
+        }
+
+        if (!strcmp(at_line + 2, "CLOSED"))
+            clients[id].state = 0;
+    }
+}
+
+static bool parse_uint(const char **s, uint32_t *v)
+{
+    const char *p = *s;
+    *v = 0;
+
+    if (*p < '0' || *p > '9')
+        return false;
+
+    while (*p >= '0' && *p <= '9') {
+        if (*v > 6553 || (*v == 6553 && *p > '5'))
+            return false;
+
+        *v = *v * 10 + (unsigned)(*p++ - '0');
+    }
+
+    *s = p;
+    return true;
+}
+
+static void uart_parse(void)
+{
+    unsigned budget = RX_SIZE;
+    if (ipd_left && elapsed(ipd_started, 5000)) rx_fault = 1;
+    uint16_t head;
+
+    if (!rx_started)
+        return;
+
+    /* Recover a UART framing/noise/overrun indication without an RX ISR. */
+    if (USART1->SR & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
+        volatile uint32_t discard = USART1->SR;
+        discard = USART1->DR;
+        (void)discard;
+        rx_fault = 1;
+    }
+
+    if (DMA1->ISR & DMA_ISR_TEIF5) {
+        DMA1->IFCR = DMA_IFCR_CTEIF5;
+        rx_fault = 1;
+    }
+
+    head = (uint16_t)((RX_SIZE - DMA1_Channel5->CNDTR) & (RX_SIZE - 1U));
+    while (rx_tail != head && budget--) {
+        char c = (char)rx_ring[rx_tail];
+        rx_tail = (uint16_t)((rx_tail + 1U) & (RX_SIZE - 1U));
+
+        if (ipd_left) {
+            if (ipd_id < CLIENTS)
+                client_byte(&clients[ipd_id], c);
+
+            ipd_left--;
+            continue;
+        }
+
+        if (c == '>' && at_used == 0) {
+            flags |= A_PROMPT;
+            at_used = 0;
+            continue;
+        }
+
+        /* Ignore the trailing space in the ESP prompt: '> '. */
+        if (c == ' ' && at_used == 0)
+            continue;
+
+        if (c == '\r')
+            continue;
+
+        if (c == '\n') {
+            at_line[at_used] = 0;
+            at_received();
+            at_used = 0;
+            continue;
+        }
+
+        if (at_used < sizeof at_line - 1)
+            at_line[at_used++] = c;
+        else {
+            rx_fault = 1;
+            at_used = 0;
+            return;
+        }
+
+        if (c == ':' &&
+            at_used > 5 &&
+            !memcmp(at_line, "+IPD,", 5)) {
+
+            at_line[at_used] = 0;
+
+            const char *p = at_line + 5;
+            uint32_t id, len;
+
+            if (parse_uint(&p, &id) &&
+                *p++ == ',' &&
+                parse_uint(&p, &len) &&
+                *p == ':' &&
+                id < CLIENTS) {
+
+                ipd_id = (uint8_t)id;
+                ipd_left = len;
+                ipd_started = ms();
+
+            } else {
+                rx_fault = 1;
+            }
+
+            at_used = 0;
+        }
+    }
+}
+
+/* HTTP command handling */
+
+static bool query(const char *path, const char *key,
+                  char *outbuf, unsigned cap)
+{
+    const char *p = strchr(path, '?');
+
+    if (!p)
+        return false;
+
+    p++;
+    unsigned k = (unsigned)strlen(key);
+
+    while (*p) {
+        if (!strncmp(p, key, k) && p[k] == '=') {
+            p += k + 1;
+
+            unsigned n = 0;
+
+            while (p[n] && p[n] != '&')
+                n++;
+
+            if (n >= cap)
+                return false;
+
+            memcpy(outbuf, p, n);
+            outbuf[n] = 0;
+            return true;
+        }
+
+        p = strchr(p, '&');
+
+        if (!p)
+            break;
+
+        p++;
+    }
+
+    return false;
+}
+
+static void execute(const char *path)
+{
+    char x[24], v[20];
+
+    reply_ok = false;
+    reply = "Invalid command";
+
+    if (!query(path, "x", x, sizeof x))
+        return;
+
+    v[0] = 0;
+    (void)query(path, "v", v, sizeof v);
+
+    safety_task();
+
+    if (!strcmp(x, "entry")) {
+        access(3, 2, 0);
+
+    } else if (!strcmp(x, "open")) {
+        if (fire) {
+            reply = "Fire already holds door open";
+            log_event(3, 2, 6, 0);
+            return;
+        }
+
+        hold = true;
+        log_event(3, 2, 2, 0);
+        say("Door: Held Open", false);
+
+    } else if (!strcmp(x, "close")) {
+        if (fire) {
+            reply = "Blocked by fire alarm";
+            log_event(3, 2, 6, 0);
+            return;
+        }
+
+        hold = false;
+        timed = false;
+        log_event(3, 2, 3, 0);
+        say("Door: Closed", false);
+
+    } else if (!strcmp(x, "fan_on")) {
+        if (fire) {
+            reply = "Fan blocked by fire";
+            return;
+        }
+
+        fan_mode = 1;
+
+    } else if (!strcmp(x, "fan_off")) {
+        fan_mode = 2;
+
+    } else if (!strcmp(x, "fan_auto")) {
+        fan_mode = 0;
+
+    } else if (!strcmp(x, "motion_on")) {
+        motion_mode = 1;
+
+    } else if (!strcmp(x, "motion_off")) {
+        motion_mode = 2;
+        motion = false;
+        locked = false;
+
+    } else if (!strcmp(x, "motion_auto")) {
+        motion_mode = 0;
+
+    } else if (!strcmp(x, "schedule")) {
+        if (!digits(v, 8))
+            return;
+
+        unsigned a = pair(v);
+        unsigned b = pair(v + 2);
+        unsigned c = pair(v + 4);
+        unsigned d = pair(v + 6);
+
+        if (a > 23 || c > 23 ||
+            b > 59 || d > 59 ||
+            a * 60 + b == c * 60 + d) {
+
+            reply = "Choose different valid hours";
+            return;
+        }
+
+        start_min = (uint16_t)(a * 60 + b);
+        end_min = (uint16_t)(c * 60 + d);
+
+    } else if (!strcmp(x, "clock")) {
+        if (!set_clock(v)) {
+            reply = "Invalid time or RTC unavailable";
+            return;
+        }
+
+    } else {
+        return;
+    }
+
+    safety_task();
+
+    reply_ok = true;
+    reply = "Command applied";
+}
+
+static void http_begin(unsigned id)
+{
+    Client *c = &clients[id];
+
+    c->state = 3;
+    client = (int)id;
+    phase = 0;
+    offset = 0;
+    kind = 3;
+    reply_ok = false;
+    reply = "Unknown request";
+
+    bool get = !strncmp(c->line, "GET ", 4);
+    bool post = !strncmp(c->line, "POST ", 5);
+
+    char *p = strchr(c->line, ' ');
+
+    if (!p)
+        return;
+
+    p++;
+
+    char *e = strchr(p, ' ');
+
+    if (!e)
+        return;
+
+    *e = 0;
+
+    if (get && !strcmp(p, "/")) {
+        kind = 0;
+
+    } else if (get && !strcmp(p, "/status")) {
+        kind = 1;
+
+    } else if (get && !strcmp(p, "/events")) {
+        kind = 2;
+        log_end = sequence;
+
+        log_next = sequence >= EVENT_COUNT
+                 ? sequence - EVENT_COUNT + 1 : 1;
+
+        comma = false;
+
+    } else if (post && !strncmp(p, "/cmd?", 5)) {
+        execute(p);
+    }
+}
+
+static unsigned http_chunk(const uint8_t **data)
+{
+    *data = (const uint8_t *)buffer;
+
+    Text t = text(buffer, sizeof buffer);
+
+    if (!phase) {
+        phase = 1;
+
+        put(&t, "HTTP/1.0 200 OK\r\nContent-Type: ");
+        put(&t, kind ? "application/json"
+                     : "text/html; charset=utf-8");
+
+        put(&t,
+            "\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n");
+
+        return t.n;
+    }
+
+    if (phase == 2)
+        return 0;
+
+    if (kind == 0) {
+        unsigned n = (unsigned)(sizeof page - 1 - offset);
+
+        if (n > CHUNK)
+            n = CHUNK;
+
+        *data = (const uint8_t *)page + offset;
+        offset += n;
+
+        if (!n)
+            phase = 2;
+
+        return n;
+    }
+
+    if (kind == 1) {
+        phase = 2;
+
+        put(&t, "{\"up\":");
+        num(&t, ms() / 1000);
+
+        put(&t, ",\"seq\":");
+        num(&t, sequence);
+
+        put(&t, ",\"ip\":");
+        quoted(&t, ip);
+
+        put(&t, ",\"door\":");
+        quoted(&t, door_status());
+
+        put(&t, ",\"fire\":");
+        num(&t, fire);
+
+        put(&t, ",\"t\":");
+        if (dht_ok)
+            num(&t, temp10);
+        else
+            put(&t, "null");
+
+        put(&t, ",\"h\":");
+        if (dht_ok)
+            num(&t, hum10);
+        else
+            put(&t, "null");
+
+        put(&t, ",\"motion\":");
+        quoted(&t, motion_status());
+
+        put(&t, ",\"mm\":");
+        num(&t, motion_mode);
+
+        put(&t, ",\"clock\":\"");
+        if (clock_good())
+            date_put(&t, date);
+        else
+            put(&t, "Clock unavailable");
+
+        put(&t, "\",\"start\":");
+        num(&t, start_min);
+
+        put(&t, ",\"end\":");
+        num(&t, end_min);
+
+        ch(&t, '}');
+        return t.n;
+    }
+
+    if (kind == 3) {
+        phase = 2;
+
+        put(&t, "{\"ok\":");
+        put(&t, reply_ok ? "true" : "false");
+
+        put(&t, ",\"message\":");
+        quoted(&t, reply);
+        ch(&t, '}');
+
+        return t.n;
+    }
+
+    if (!offset) {
+        ch(&t, '[');
+        offset = 1;
+    }
+
+    while (log_next <= log_end &&
+           sizeof buffer - t.n > 128) {
+
+        Event e = events[(log_next - 1) % EVENT_COUNT];
+        log_next++;
+
+        if (e.seq != log_next - 1)
+            continue;
+
+        if (comma)
+            ch(&t, ',');
+
+        comma = true;
+
+        ch(&t, '[');
+        num(&t, e.seq);
+
+        put(&t, ",\"");
+        if (e.valid)
+            date_put(&t, e.date);
+
+        put(&t, "\",");
+        num(&t, e.who);
+
+        ch(&t, ',');
+        num(&t, e.method);
+
+        ch(&t, ',');
+        num(&t, e.result);
+
+        put(&t, ",\"");
+        if (e.uid)
+            hex8(&t, e.uid);
+
+        put(&t, "\",");
+        num(&t, e.valid);
+
+        ch(&t, ',');
+        num(&t, e.up);
+
+        ch(&t, ']');
+    }
+
+    if (log_next > log_end) {
+        ch(&t, ']');
+        phase = 2;
+    }
+
+    return t.n;
+}
+
+/* Non-blocking ESP8266 AT state machine */
+
+enum {
+    W_BACKOFF,
+    W_RESET,
+    W_SETUP,
+    W_IDLE,
+    W_PROMPT,
+    W_SENT,
+    W_CLOSE,
+    W_PING
+};
+
+static uint8_t wifi_state, setup_step;
+static bool at_wait;
+static uint8_t health_misses, ip_tries;
+static uint32_t deadline = 1500, ping_at;
+
+static const uint8_t *send_data;
+static unsigned send_len;
+
+static bool at_send(const char *s, uint32_t timeout)
+{
+    unsigned n = (unsigned)strlen(s);
+
+    if (n >= sizeof at_command)
+        return false;
+
+    uart_parse();
+    if (rx_fault) return false;
+    memcpy(at_command, s, n + 1U);
+    /* Preserve asynchronous notifications across command boundaries. */
+    flags &= A_READY | A_DOWN;
+    if (!strcmp(s, "AT+CIFSR\r\n")) ip_seen = false;
+
+    /* Blocking TX matches the reference design and removes the need for
+       USART1 TX interrupts. DMA continues collecting ESP-01 replies. */
+    if (HAL_UART_Transmit(&huart1, (uint8_t *)at_command,
+                          (uint16_t)n, 1000U) != HAL_OK)
+        return false;
+
+    deadline = ms() + timeout;
+    return true;
+}
+
+static void restart(void)
+{
+    (void)HAL_UART_AbortTransmit(&huart1);
+
+    wifi_restarts++;
+    online = false;
+    ip[0] = 0;
+    wifi_state = W_BACKOFF;
+    deadline = ms() + 15000;
+
+    at_wait = false;
+    flags = 0;
+    at_used = 0;
+    ipd_left = 0;
+    client = -1;
+
+    memset(clients, 0, sizeof clients);
+}
+
+static bool client_command(bool sending)
+{
+    char b[40];
+    Text t = text(b, sizeof b);
+
+    put(&t, sending ? "AT+CIPSEND=" : "AT+CIPCLOSE=");
+    num(&t, (unsigned)client);
+
+    if (sending) {
+        ch(&t, ',');
+        num(&t, send_len);
+    }
+
+    put(&t, "\r\n");
+
+    return at_send(b, sending ? 3000 : 2000);
+}
+
+static void wifi_task(void)
+{
+    static const char *const setup[] = {
+        "ATE0\r\n",
+        "AT+CWMODE=1\r\n",
+        "AT+CWDHCP=1,1\r\n",
+        "AT+CWJAP=\"" WIFI_SSID "\",\"" WIFI_PASSWORD "\"\r\n",
+        "AT+CIPMODE=0\r\n",
+        "AT+CIPMUX=1\r\n",
+        "AT+CIPSERVER=0\r\n",
+        "AT+CIPDINFO=0\r\n",
+        "AT+CIPRECVMODE=0\r\n",
+        "AT+CIPSERVER=1,80\r\n",
+        "AT+CIPSTO=10\r\n",
+        "AT+CIFSR\r\n"
+    };
+
+    uart_parse();
+
+    if (rx_fault) {
+        wifi_rx_faults++;
+        rx_fault = 0;
+        uart_rx_start();
+        at_used = 0;
+        ipd_left = 0;
+        /* Discard baud-mismatched boot noise without resetting again. */
+        if (wifi_state != W_RESET && wifi_state != W_BACKOFF)
+            restart();
+        return;
+    }
+
+    if ((wifi_state != W_BACKOFF &&
+         wifi_state != W_RESET &&
+         (flags & A_READY)) ||
+        (wifi_state >= W_IDLE && (flags & A_DOWN))) {
+
+        restart();
+        return;
+    }
+
+    if (wifi_state == W_BACKOFF) {
+        if (due(deadline) && at_send("AT+RST\r\n", 8000))
+            wifi_state = W_RESET;
+
+        return;
+    }
+
+    if (wifi_state == W_RESET) {
+        if ((flags & A_READY) &&
+            huart1.gState == HAL_UART_STATE_READY) {
+
+            wifi_state = W_SETUP;
+            setup_step = 0;
+            ip_tries = 0;
+            health_misses = 0;
+            at_wait = false;
+            flags = 0;
+
+        } else if (due(deadline)) {
+            restart();
+        }
+
+        return;
+    }
+
+    if (wifi_state == W_SETUP) {
+        if (!at_wait) {
+            at_wait = at_send(
+                setup[setup_step], setup_step == 3 ? 45000 : 3000);
+            return;
+        }
+
+        bool optional =
+            setup_step == 6 ||
+            setup_step == 8 ||
+            setup_step == 10;
+
+        if ((flags & A_OK) || (optional && (flags & A_ERROR))) {
+            at_wait = false;
+            flags = 0;
+
+            if (++setup_step == sizeof setup / sizeof setup[0]) {
+                if (!ip_seen || !ip[0]) {
+                    if (++ip_tries >= 5) { restart(); return; }
+                    /* Retry only CIFSR; do not repeatedly reset/rejoin Wi-Fi
+                       just because the first IP response was missed. */
+                    setup_step = (sizeof setup / sizeof setup[0]) - 1;
+                    return;
+                }
+
+                online = true;
+                wifi_state = W_IDLE;
+                ping_at = ms() + 30000;
+            }
+
+        } else if ((flags & A_ERROR) || due(deadline)) {
+            restart();
+        }
+
+        return;
+    }
+
+    if (wifi_state == W_IDLE) {
+        if (huart1.gState != HAL_UART_STATE_READY)
+            return;
+
+        if (client < 0) {
+            for (unsigned i = 0; i < CLIENTS; i++) {
+                if (clients[i].state == 1 &&
+                    elapsed(clients[i].at, 5000)) {
+
+                    clients[i].line[0] = 0;
+                    clients[i].state = 2;
+                }
+
+                if (clients[i].state == 2) {
+                    http_begin(i);
+                    break;
+                }
+            }
+        }
+
+        if (client >= 0) {
+            if (!clients[client].state) {
+                client = -1;
+                return;
+            }
+
+            send_len = http_chunk(&send_data);
+
+            if (client_command(send_len != 0)) {
+                wifi_state = send_len ? W_PROMPT : W_CLOSE;
+            } else {
+                restart();
+            }
+
+        } else if (due(ping_at)) {
+            if (at_send("AT+CIFSR\r\n", 3000))
+                wifi_state = W_PING;
+        }
+
+        return;
+    }
+
+    if (wifi_state == W_PROMPT && (flags & A_PROMPT)) {
+        flags = 0;
+
+        if (HAL_UART_Transmit(&huart1, (uint8_t *)send_data,
+                              (uint16_t)send_len, 500U) == HAL_OK) {
+            wifi_state = W_SENT;
+            deadline = ms() + 5000U;
+        } else {
+            restart();
+        }
+
+        return;
+    }
+
+    if (wifi_state == W_SENT && (flags & A_SENT)) {
+
+        flags = 0;
+        wifi_state = W_IDLE;
+        return;
+    }
+
+    if (wifi_state == W_CLOSE &&
+        ((flags & (A_OK | A_ERROR)) || due(deadline))) {
+
+        if (client >= 0)
+            memset(&clients[client], 0, sizeof(Client));
+
+        client = -1;
+        flags = 0;
+        wifi_state = W_IDLE;
+        return;
+    }
+
+    if (wifi_state == W_PING &&
+        ((flags & (A_OK | A_ERROR)) || due(deadline))) {
+        if ((flags & A_OK) && ip_seen && ip[0]) {
+            health_misses = 0;
+        } else {
+            wifi_health_failures++;
+            if (++health_misses >= 3) { restart(); return; }
+        }
+        flags = 0;
+        ping_at = ms() + (health_misses ? 5000U : 30000U);
+        wifi_state = W_IDLE;
+        return;
+    }
+
+    if ((wifi_state == W_PROMPT || wifi_state == W_SENT) &&
+        (flags & A_ERROR)) {
+
+        if (client_command(false))
+            wifi_state = W_CLOSE;
+        else if (due(deadline))
+            restart();
+
+        return;
+    }
+
+    if ((flags & A_ERROR) || due(deadline))
+        restart();
+}
+
+/* Clock and peripheral initialization */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef o = {0};
+    RCC_ClkInitTypeDef c = {0};
+
+    o.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    o.HSIState = RCC_HSI_ON;
+    o.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+
+    o.PLL.PLLState = RCC_PLL_ON;
+    o.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+    o.PLL.PLLMUL = RCC_PLL_MUL16;
+
+    if (HAL_RCC_OscConfig(&o) != HAL_OK)
+        Error_Handler();
+
+    c.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    c.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    c.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    c.APB1CLKDivider = RCC_HCLK_DIV2;
+    c.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&c, FLASH_LATENCY_2) != HAL_OK)
+        Error_Handler();
+}
+
+static void hardware_init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+
+    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+
+    __HAL_AFIO_REMAP_SPI1_DISABLE();
+    __HAL_AFIO_REMAP_I2C1_DISABLE();
+    __HAL_AFIO_REMAP_USART1_DISABLE();
+    __HAL_AFIO_REMAP_TIM2_DISABLE();
+
+    HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
+
+    out(GPIOA,
+        RFID_CS | RFID_RST | GPIO_PIN_2 | GPIO_PIN_3,
+        true);
+
+    out(GPIOB,
+        FAN_PIN | WATER_PIN | DHT_PIN | GPIO_PIN_3 | GPIO_PIN_4,
+        true);
+
+    out(GPIOB, BUZZER_PIN, false);
+    out(GPIOC, GPIO_PIN_13, true);
+
+    gpio(GPIOA, RFID_CS | RFID_RST,
+         GPIO_MODE_OUTPUT_PP, GPIO_NOPULL);
+
+    gpio(GPIOA, GPIO_PIN_2 | GPIO_PIN_3,
+         GPIO_MODE_OUTPUT_OD, GPIO_NOPULL);
+
+    gpio(GPIOB, GPIO_PIN_3 | GPIO_PIN_4,
+         GPIO_MODE_OUTPUT_OD, GPIO_NOPULL);
+
+    gpio(GPIOB,
+         GPIO_PIN_5 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14,
+         GPIO_MODE_INPUT, GPIO_PULLUP);
+
+    gpio(GPIOB, FAN_PIN | WATER_PIN | BUZZER_PIN,
+         GPIO_MODE_OUTPUT_PP, GPIO_NOPULL);
+
+    gpio(GPIOC, GPIO_PIN_13,
+         GPIO_MODE_OUTPUT_PP, GPIO_NOPULL);
+
+    gpio(GPIOB, DHT_PIN,
+         GPIO_MODE_OUTPUT_OD, GPIO_PULLUP);
+
+    gpio(GPIOB, PIR_PIN,
+         GPIO_MODE_INPUT, GPIO_NOPULL);
+
+    gpio(GPIOB, FLAME_PIN,
+         FLAME_ACTIVE_LOW
+             ? GPIO_MODE_IT_FALLING : GPIO_MODE_IT_RISING,
+         FLAME_ACTIVE_LOW
+             ? GPIO_PULLUP : GPIO_PULLDOWN);
+
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    __HAL_RCC_TIM2_CLK_ENABLE();
+
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = 63;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 65535;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+        Error_Handler();
+
+    TIM3->SMCR = 0;
+    TIM3->CR2 = 0;
+
+    if (HAL_TIM_Base_Start(&htim3) != HAL_OK)
+        Error_Handler();
+
+    htim2.Instance = TIM2;
+    htim2.Init.Prescaler = 63;
+    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim2.Init.Period = 19999;
+    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+        Error_Handler();
+
+    TIM2->SMCR = 0;
+    TIM2->CR2 = 0;
+
+    TIM_OC_InitTypeDef p = {0};
+
+    p.OCMode = TIM_OCMODE_PWM1;
+    p.Pulse = SERVO_CLOSED_US;
+    p.OCPolarity = TIM_OCPOLARITY_HIGH;
+    p.OCFastMode = TIM_OCFAST_DISABLE;
+
+    if (HAL_TIM_PWM_ConfigChannel(
+            &htim2, &p, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+
+    gpio(GPIOA, GPIO_PIN_0,
+         GPIO_MODE_AF_PP, GPIO_NOPULL);
+
+    if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+
+    boot_at = ms();
+    safety_task();
+
+    __HAL_GPIO_EXTI_CLEAR_IT(FLAME_PIN);
+    HAL_NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    gpio(GPIOB, GPIO_PIN_6 | GPIO_PIN_7,
+         GPIO_MODE_AF_OD, GPIO_NOPULL);
+
+    bus_bad = HAL_I2C_Init(&hi2c1) != HAL_OK;
+
+    gpio(GPIOB, GPIO_PIN_6 | GPIO_PIN_7,
+         GPIO_MODE_AF_OD, GPIO_NOPULL);
+
+    __HAL_RCC_SPI1_CLK_ENABLE();
+
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 7;
+
+    (void)HAL_SPI_Init(&hspi1);
+
+    gpio(GPIOA, GPIO_PIN_5 | GPIO_PIN_7,
+         GPIO_MODE_AF_PP, GPIO_NOPULL);
+
+    gpio(GPIOA, GPIO_PIN_6,
+         GPIO_MODE_INPUT, GPIO_NOPULL);
+
+    __HAL_RCC_USART1_CLK_ENABLE();
+
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    (void)HAL_UART_Init(&huart1);
+
+    gpio(GPIOA, GPIO_PIN_9,
+         GPIO_MODE_AF_PP, GPIO_NOPULL);
+
+    gpio(GPIOA, GPIO_PIN_10,
+         GPIO_MODE_INPUT, GPIO_PULLUP);
+
+    uart_rx_start();
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    hardware_init();
+
+    while (1) {
+        /* Wi-Fi and LCD must run during startup; sensors stay idle until the
+           Wi-Fi startup window completes (connected, or 10-second timeout). */
+        wifi_task();
+        display_task();
+        lcd_task();
+
+        if (startup_complete) {
+            safety_task();
+            keypad_task();
+            uart_parse();
+            safety_task();
+            dht_task();
+            uart_parse();
+            safety_task();
+            rfid_task();
+            uart_parse();
+            safety_task();
+            bus_task();
+            rtc_task();
+            uart_parse();
+            safety_task();
+        }
+    }
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIOB->BSRR = FAN_PIN | WATER_PIN;
+    GPIOB->BRR = BUZZER_PIN;
+
+    for (;;) {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    (void)file;
+    (void)line;
+
+    Error_Handler();
+}
+#endif
